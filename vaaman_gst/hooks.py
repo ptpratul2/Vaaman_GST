@@ -264,13 +264,5 @@ fixtures = [
     }
 ]
 
-override_doctype_class = {
-    "Purchase Reconciliation Tool": "vaaman_gst.overrides.purchase_reconciliation_tool.CustomPurchaseReconciliationTool"
-}
-
-
-# import india_compliance.gst_india.doctype.purchase_reconciliation_tool.purchase_reconciliation_tool as original
-
-# from vaaman_gst.overrides.purchase_reconciliation_tool import CustomPurchaseReconciliationTool
-
-# original.PurchaseReconciliationTool.get_invoice_columns = CustomPurchaseReconciliationTool.get_invoice_columns
+# Excel column layout is customized by patching BuildExcel in vaaman_gst/__init__.py
+# (get_invoice_columns lives on BuildExcel, not on the Purchase Reconciliation Tool DocType).
