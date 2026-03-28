@@ -43,7 +43,7 @@ app_license = "mit"
 # page_js = {"page" : "public/js/file.js"}
 
 # include js in doctype views
-# doctype_js = {"doctype" : "public/js/doctype.js"}
+doctype_js = {"Purchase Invoice" : "public/js/match_status.js"}
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
@@ -138,8 +138,8 @@ app_license = "mit"
 # Hook on document methods and events
 
 # doc_events = {
-# 	"*": {
-# 		"on_update": "method",
+# 	"Purchase Invoice": {
+# 		"before_submit": "vaaman_gst.vaaman_gst.match_status.set_match_status"
 # 		"on_cancel": "method",
 # 		"on_trash": "method"
 # 	}
@@ -247,3 +247,30 @@ app_license = "mit"
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
 
+# override_doctype_class = {
+#     "Purchase Reconciliation Tool": "vaaman_gst.overrides.purchase_reconciliation_tool.PurchaseReconciliationTool"
+# }
+
+fixtures = [
+    {
+        "doctype": "Custom Field",
+        "filters": {
+            "name": [
+                "in", [
+                    "Purchase Invoice-custom_match_status"
+                ]
+            ]
+        }
+    }
+]
+
+override_doctype_class = {
+    "Purchase Reconciliation Tool": "vaaman_gst.overrides.purchase_reconciliation_tool.CustomPurchaseReconciliationTool"
+}
+
+
+# import india_compliance.gst_india.doctype.purchase_reconciliation_tool.purchase_reconciliation_tool as original
+
+# from vaaman_gst.overrides.purchase_reconciliation_tool import CustomPurchaseReconciliationTool
+
+# original.PurchaseReconciliationTool.get_invoice_columns = CustomPurchaseReconciliationTool.get_invoice_columns
