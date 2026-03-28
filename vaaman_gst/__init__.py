@@ -1,8 +1,14 @@
 __version__ = "0.0.1"
 
 
-# from india_compliance.gst_india.doctype.purchase_reconciliation_tool import purchase_reconciliation_tool
+def _patch_purchase_reconciliation_excel():
+	try:
+		from vaaman_gst.overrides.purchase_reconciliation_tool import patch_build_excel
 
-# from overrides.purchase_reconciliation_tool import CustomPurchaseReconciliationTool
+		patch_build_excel()
+	except ImportError:
+		# india_compliance not installed on this bench — Purchase Reconciliation Excel patch skipped
+		pass
 
-# purchase_reconciliation_tool.PurchaseReconciliationTool = CustomPurchaseReconciliationTool
+
+_patch_purchase_reconciliation_excel()
