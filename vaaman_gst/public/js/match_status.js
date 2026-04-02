@@ -10,7 +10,7 @@ frappe.ui.form.on('Purchase Invoice', {
             callback: function(r) {
                 if (r.message !== undefined && frm.doc.custom_match_status !== r.message) {
                     frm.set_value('custom_match_status', r.message);
-                    // frm.save();  // ✅ DB save
+                    // frm.save(); 
                 }
             }
         });
