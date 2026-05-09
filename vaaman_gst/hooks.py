@@ -27,6 +27,7 @@ app_license = "mit"
 # include js, css files in header of desk.html
 # app_include_css = "/assets/vaaman_gst/css/vaaman_gst.css"
 # app_include_js = "/assets/vaaman_gst/js/vaaman_gst.js"
+# app_include_js = "/assets/vaaman_gst/js/vaaman_gst.js"
 
 # include js, css files in header of web template
 # web_include_css = "/assets/vaaman_gst/css/vaaman_gst.css"
@@ -44,6 +45,7 @@ app_license = "mit"
 
 # include js in doctype views
 doctype_js = {"Purchase Invoice" : "public/js/match_status.js"}
+doctype_js = {"Purchase Reconciliation Tool" : "public/js/purchase_reconciliation_tool.js"}
 # doctype_list_js = {"Purchase Reconciliation Tool" : "public/js/purchase_reconciliation.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
