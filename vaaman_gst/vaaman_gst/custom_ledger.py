@@ -1,14 +1,13 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 # License: GNU General Public License v3. See license.txt
 
-
 import copy
 from collections import OrderedDict
 
 import frappe
 from frappe import _, _dict
 from frappe.query_builder import Criterion
-from frappe.utils import cstr, getdate, flt # CUSTOM CHANGE: Added flt for tax calculations
+from frappe.utils import cstr, getdate, flt
 
 from erpnext import get_company_currency, get_default_company
 from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import (
@@ -21,15 +20,16 @@ from erpnext.accounts.utils import get_account_currency
 
 
 def execute(filters=None):
+	"""Main entry point for the report"""
 	if not filters:
 		return [], []
 
 	account_details = {}
 
-
 	if filters and filters.get("print_in_account_currency") and not filters.get("account"):
 		frappe.throw(_("Select an account to print in account currency"))
 
+	# Load all accounts to check for group/child status
 	for acc in frappe.db.sql("""select name, is_group from tabAccount""", as_dict=1):
 		account_details.setdefault(acc.name, acc)
 
@@ -37,19 +37,17 @@ def execute(filters=None):
 		filters.party = frappe.parse_json(filters.get("party"))
 
 	validate_filters(filters, account_details)
-
 	validate_party(filters)
-
 	filters = set_account_currency(filters)
 
 	columns = get_columns(filters)
-
 	res = get_result(filters, account_details)
 
 	return columns, res
 
 
 def validate_filters(filters, account_details):
+	"""Validate UI filters"""
 	if not filters.get("company"):
 		frappe.throw(_("{0} is mandatory").format(_("Company")))
 
@@ -88,8 +86,8 @@ def validate_filters(filters, account_details):
 
 
 def validate_party(filters):
+	"""Ensure party exists in the system"""
 	party_type, party = filters.get("party_type"), filters.get("party")
-
 	if party and party_type:
 		for d in party:
 			if not frappe.db.exists(party_type, d):
@@ -97,6 +95,7 @@ def validate_party(filters):
 
 
 def set_account_currency(filters):
+	"""Set relevant currencies for the report"""
 	if filters.get("account") or (filters.get("party") and len(filters.party) == 1):
 		filters["company_currency"] = frappe.get_cached_value("Company", filters.company, "default_currency")
 		account_currency = None
@@ -111,7 +110,6 @@ def set_account_currency(filters):
 					if get_account_currency(account) != currency:
 						is_same_account_currency = False
 						break
-
 				if is_same_account_currency:
 					account_currency = currency
 
@@ -121,7 +119,6 @@ def set_account_currency(filters):
 				{"party_type": filters.party_type, "party": filters.party[0], "company": filters.company},
 				"account_currency",
 			)
-
 			if gle_currency:
 				account_currency = gle_currency
 			else:
@@ -139,51 +136,66 @@ def set_account_currency(filters):
 
 
 def get_result(filters, account_details):
+	"""Gather GL data and apply custom enrichments"""
 	accounting_dimensions = []
 	if filters.get("include_dimensions"):
 		accounting_dimensions = get_accounting_dimensions()
 
 	gl_entries = get_gl_entries(filters, accounting_dimensions)
 
-	# CUSTOM CHANGE: Enriching GL entries with PAN and Tax details
+	# CUSTOM ENRICHMENT: Fetch additional details like PAN and GST/TDS info
 	gl_entries = enrich_purchase_invoice_details(gl_entries)
 
 	data = get_data_with_opening_closing(filters, account_details, accounting_dimensions, gl_entries)
-
 	result = get_result_as_list(data, filters)
 
 	return result
 
-# CUSTOM CHANGE: Helper Function updated to fetch TDS Rate and PI Total as Taxable Value
+
 def enrich_purchase_invoice_details(gl_entries):
+	"""
+	CUSTOM FIX: Processes records in chunks of 500 to prevent JobTimeoutException
+	Fetches Supplier PAN, TDS Rates, and Taxable Values for the ledger.
+	"""
 	pi_names = list(set([d.voucher_no for d in gl_entries if d.voucher_type == "Purchase Invoice"]))
 	if not pi_names:
 		return gl_entries
 
 	pi_info_map = {}
-	# CUSTOM CHANGE: Fetching 'total' field for Taxable Amount data source
-	pi_data = frappe.get_all("Purchase Invoice", filters={"name": ["in", pi_names]}, fields=["name", "supplier", "total"])
-	for d in pi_data:
-		pi_info_map[d.name] = {"supplier": d.supplier, "total": d.total}
+	chunk_size = 500  # Process 500 items at a time to keep SQL query strings small
+
+	# Fetch Purchase Invoice Details (Supplier and Total) in chunks
+	for i in range(0, len(pi_names), chunk_size):
+		chunk = pi_names[i : i + chunk_size]
+		pi_data = frappe.get_all("Purchase Invoice", filters={"name": ["in", chunk]}, fields=["name", "supplier", "total"])
+		for d in pi_data:
+			pi_info_map[d.name] = {"supplier": d.supplier, "total": d.total}
 
 	unique_suppliers = list(set(d["supplier"] for d in pi_info_map.values()))
 	supplier_pan_map = {}
+	
+	# Fetch Supplier PAN details in chunks
 	if unique_suppliers:
-		supplier_data = frappe.get_all("Supplier", filters={"name": ["in", unique_suppliers]}, fields=["name", "pan"])
-		for s in supplier_data:
-			supplier_pan_map[s.name] = s.pan or ""
+		for i in range(0, len(unique_suppliers), chunk_size):
+			chunk = unique_suppliers[i : i + chunk_size]
+			supplier_data = frappe.get_all("Supplier", filters={"name": ["in", chunk]}, fields=["name", "pan"])
+			for s in supplier_data:
+				supplier_pan_map[s.name] = s.pan or ""
 
-	# CUSTOM CHANGE: Updated SQL to fetch rate ONLY for account_head "TDS Payable"
+	# Fetch TDS Tax Rates in chunks
 	tax_map = {}
-	tax_data = frappe.db.sql("""
-		SELECT parent, rate
-		FROM `tabPurchase Taxes and Charges`
-		WHERE parent IN %s AND account_head LIKE 'TDS Payable%%' AND docstatus = 1
-	""", (pi_names,), as_dict=1)
+	for i in range(0, len(pi_names), chunk_size):
+		chunk = pi_names[i : i + chunk_size]
+		tax_data = frappe.db.sql("""
+			SELECT parent, rate
+			FROM `tabPurchase Taxes and Charges`
+			WHERE parent IN %s AND account_head LIKE 'TDS Payable%%' AND docstatus = 1
+		""", (chunk,), as_dict=1)
+		
+		for t in tax_data:
+			tax_map[t.parent] = f"{flt(t.rate, 2)}%"
 
-	for t in tax_data:
-		tax_map[t.parent] = f"{flt(t.rate, 2)}%"
-
+	# Map fetched data back to the main GL Entry objects
 	for entry in gl_entries:
 		entry["supplier_pan"] = ""
 		entry["tax_rate"] = ""
@@ -192,19 +204,17 @@ def enrich_purchase_invoice_details(gl_entries):
 			pi_info = pi_info_map.get(entry.voucher_no)
 			if pi_info:
 				entry["supplier_pan"] = supplier_pan_map.get(pi_info["supplier"], "")
-				# CUSTOM CHANGE: Taxable Amount Column mapping to Purchase Invoice.total field
 				entry["taxable_value"] = pi_info["total"]
 			
-			# CUSTOM CHANGE: Tax Rate Column mapping to TDS Payable rate
 			if entry.voucher_no in tax_map:
 				entry["tax_rate"] = tax_map[entry.voucher_no]
 	return gl_entries
 
 
 def get_gl_entries(filters, accounting_dimensions):
+	"""Execute SQL to fetch GL Entries based on filters"""
 	currency_map = get_currency(filters)
-	select_fields = """, debit, credit, debit_in_account_currency,
-		credit_in_account_currency """
+	select_fields = """, debit, credit, debit_in_account_currency, credit_in_account_currency """
 
 	if filters.get("show_remarks"):
 		if remarks_length := frappe.db.get_single_value("Accounts Settings", "general_ledger_remarks_length"):
@@ -266,11 +276,9 @@ def get_gl_entries(filters, accounting_dimensions):
 
 
 def get_conditions(filters):
+	"""Build SQL WHERE conditions"""
 	conditions = []
-
-	ignore_is_opening = frappe.db.get_single_value(
-		"Accounts Settings", "ignore_is_opening_check_for_reporting"
-	)
+	ignore_is_opening = frappe.db.get_single_value("Accounts Settings", "ignore_is_opening_check_for_reporting")
 
 	if filters.get("account"):
 		filters.account = get_accounts_with_children(filters.account)
@@ -329,11 +337,7 @@ def get_conditions(filters):
 	if filters.get("party"):
 		conditions.append("party in %(party)s")
 
-	if not (
-		filters.get("account")
-		or filters.get("party")
-		or filters.get("categorize_by") in ["Categorize by Account", "Categorize by Party"]
-	):
+	if not (filters.get("account") or filters.get("party") or filters.get("categorize_by") in ["Categorize by Account", "Categorize by Party"]):
 		if not ignore_is_opening:
 			conditions.append("(posting_date >=%(from_date)s or is_opening = 'Yes')")
 		else:
@@ -347,14 +351,11 @@ def get_conditions(filters):
 	if filters.get("project"):
 		conditions.append("project in %(project)s")
 
+	# Finance Book conditions
 	if filters.get("include_default_book_entries"):
 		if filters.get("finance_book"):
-			if filters.get("company_fb") and cstr(filters.get("finance_book")) != cstr(
-				filters.get("company_fb")
-			):
-				frappe.throw(
-					_("To use a different finance book, please uncheck 'Include Default FB Entries'")
-				)
+			if filters.get("company_fb") and cstr(filters.get("finance_book")) != cstr(filters.get("company_fb")):
+				frappe.throw(_("To use a different finance book, please uncheck 'Include Default FB Entries'"))
 			else:
 				conditions.append("(finance_book in (%(finance_book)s, '') OR finance_book IS NULL)")
 		else:
@@ -369,17 +370,13 @@ def get_conditions(filters):
 		conditions.append("is_cancelled = 0")
 
 	from frappe.desk.reportview import build_match_conditions
-
 	match_conditions = build_match_conditions("GL Entry")
-
 	if match_conditions:
 		conditions.append(match_conditions)
 
 	accounting_dimensions = get_accounting_dimensions(as_list=False)
-
 	if accounting_dimensions:
 		for dimension in accounting_dimensions:
-			# Ignore 'Finance Book' set up as dimension in below logic, as it is already handled in above section
 			if not dimension.disabled and dimension.document_type != "Finance Book":
 				if filters.get(dimension.fieldname):
 					if frappe.get_cached_value("DocType", dimension.document_type, "is_tree"):
@@ -394,20 +391,19 @@ def get_conditions(filters):
 
 
 def get_party_name_map():
+	"""Helper to map party IDs to their display names"""
 	party_map = {}
-
 	customers = frappe.get_all("Customer", fields=["name", "customer_name"])
 	party_map["Customer"] = {c.name: c.customer_name for c in customers}
-
 	suppliers = frappe.get_all("Supplier", fields=["name", "supplier_name"])
 	party_map["Supplier"] = {s.name: s.supplier_name for s in suppliers}
-
 	employees = frappe.get_all("Employee", fields=["name", "employee_name"])
 	party_map["Employee"] = {e.name: e.employee_name for e in employees}
 	return party_map
 
 
 def get_accounts_with_children(accounts):
+	"""Handle hierarchy of accounts for filtering"""
 	if not isinstance(accounts, list):
 		accounts = [d.strip() for d in accounts.strip().split(",") if d]
 
@@ -430,29 +426,26 @@ def get_accounts_with_children(accounts):
 
 
 def set_bill_no(gl_entries):
+	"""Map Purchase Invoice Bill Number to GL entries"""
 	inv_details = get_supplier_invoice_details()
 	for gl in gl_entries:
 		gl["bill_no"] = inv_details.get(gl.get("against_voucher"), "")
 
 
 def get_data_with_opening_closing(filters, account_details, accounting_dimensions, gl_entries):
+	"""Add Opening, Totals, and Closing rows to the result data"""
 	data = []
 	totals_dict = get_totals_dict()
-
 	set_bill_no(gl_entries)
-
 	gle_map = initialize_gle_map(gl_entries, filters, totals_dict)
-
 	totals, entries = get_accountwise_gle(filters, accounting_dimensions, gl_entries, gle_map, totals_dict)
 
-	# Opening for filtered account
+	# Main Opening row
 	data.append(totals.opening)
 
 	if filters.get("categorize_by") != "Categorize by Voucher (Consolidated)":
 		for _acc, acc_dict in gle_map.items():
-			# acc
 			if acc_dict.entries:
-				# opening
 				data.append({"debit_in_transaction_currency": None, "credit_in_transaction_currency": None})
 				if (not filters.get("categorize_by") and not filters.get("voucher_no")) or (
 					filters.get("categorize_by") and filters.get("categorize_by") != "Categorize by Voucher"
@@ -461,11 +454,9 @@ def get_data_with_opening_closing(filters, account_details, accounting_dimension
 
 				data += acc_dict.entries
 
-				# totals
 				if filters.get("categorize_by") or not filters.voucher_no:
 					data.append(acc_dict.totals.total)
 
-				# closing
 				if (not filters.get("categorize_by") and not filters.get("voucher_no")) or (
 					filters.get("categorize_by") and filters.get("categorize_by") != "Categorize by Voucher"
 				):
@@ -475,16 +466,15 @@ def get_data_with_opening_closing(filters, account_details, accounting_dimension
 	else:
 		data += entries
 
-	# totals
+	# Grand totals and Final Closing row
 	data.append(totals.total)
-
-	# closing
 	data.append(totals.closing)
 
 	return data
 
 
 def get_totals_dict():
+	"""Helper for initializing data structure of summary rows"""
 	def _get_debit_credit_dict(label):
 		return _dict(
 			account=f"'{label}'",
@@ -494,7 +484,6 @@ def get_totals_dict():
 			credit_in_account_currency=0.0,
 			debit_in_transaction_currency=None,
 			credit_in_transaction_currency=None,
-			# CUSTOM CHANGE: Initialize new fields for totals rows to prevent export error
 			supplier_pan="",
 			tax_rate="",
 			taxable_value=0.0
@@ -508,6 +497,7 @@ def get_totals_dict():
 
 
 def group_by_field(group_by):
+	"""Identify the field used for grouping"""
 	if group_by == "Categorize by Party":
 		return "party"
 	elif group_by in ["Categorize by Voucher (Consolidated)", "Categorize by Account"]:
@@ -517,15 +507,16 @@ def group_by_field(group_by):
 
 
 def initialize_gle_map(gl_entries, filters, totals_dict):
+	"""Prepare the dictionary structure for grouped data"""
 	gle_map = OrderedDict()
 	group_by = group_by_field(filters.get("categorize_by"))
-
 	for gle in gl_entries:
 		gle_map.setdefault(gle.get(group_by), _dict(totals=copy.deepcopy(totals_dict), entries=[]))
 	return gle_map
 
 
 def get_accountwise_gle(filters, accounting_dimensions, gl_entries, gle_map, totals):
+	"""Aggregate values and apply grouping logic"""
 	entries = []
 	consolidated_gle = OrderedDict()
 	group_by = group_by_field(filters.get("categorize_by"))
@@ -539,11 +530,10 @@ def get_accountwise_gle(filters, accounting_dimensions, gl_entries, gle_map, tot
 	def update_value_in_dict(data, key, gle, show_net_values=False):
 		data[key].debit += gle.debit
 		data[key].credit += gle.credit
-
 		data[key].debit_in_account_currency += gle.debit_in_account_currency
 		data[key].credit_in_account_currency += gle.credit_in_account_currency
 
-		# CUSTOM CHANGE: Preserve custom fields during aggregation
+		# CUSTOM: Add values for new columns in aggregation rows
 		if gle.get("supplier_pan"): data[key].supplier_pan = gle.get("supplier_pan")
 		if gle.get("tax_rate"): data[key].tax_rate = gle.get("tax_rate")
 		if gle.get("taxable_value"): 
@@ -553,26 +543,11 @@ def get_accountwise_gle(filters, accounting_dimensions, gl_entries, gle_map, tot
 			data[key].debit_in_transaction_currency += gle.debit_in_transaction_currency
 			data[key].credit_in_transaction_currency += gle.credit_in_transaction_currency
 
-		if (
-			filters.get("show_net_values_in_party_account")
-			and account_type_map.get(data[key].account)
-			in (
-				"Receivable",
-				"Payable",
-			)
-		) or show_net_values:
+		if (filters.get("show_net_values_in_party_account") and account_type_map.get(data[key].account) in ("Receivable","Payable",)) or show_net_values:
 			net_value = data[key].debit - data[key].credit
-			net_value_in_account_currency = (
-				data[key].debit_in_account_currency - data[key].credit_in_account_currency
-			)
-
-			if net_value < 0:
-				dr_or_cr = "credit"
-				rev_dr_or_cr = "debit"
-			else:
-				dr_or_cr = "debit"
-				rev_dr_or_cr = "credit"
-
+			net_value_in_account_currency = data[key].debit_in_account_currency - data[key].credit_in_account_currency
+			dr_or_cr = "credit" if net_value < 0 else "debit"
+			rev_dr_or_cr = "debit" if net_value < 0 else "credit"
 			data[key][dr_or_cr] = abs(net_value)
 			data[key][dr_or_cr + "_in_account_currency"] = abs(net_value_in_account_currency)
 			data[key][rev_dr_or_cr] = 0
@@ -586,56 +561,31 @@ def get_accountwise_gle(filters, accounting_dimensions, gl_entries, gle_map, tot
 
 	for gle in gl_entries:
 		group_by_value = gle.get(group_by)
-		gle.voucher_type = gle.voucher_type
-
 		if gle.posting_date < from_date or (cstr(gle.is_opening) == "Yes" and not show_opening_entries):
 			if not group_by_voucher_consolidated:
 				update_value_in_dict(gle_map[group_by_value].totals, "opening", gle, True)
 				update_value_in_dict(gle_map[group_by_value].totals, "closing", gle, True)
-
 			update_value_in_dict(totals, "opening", gle, True)
 			update_value_in_dict(totals, "closing", gle, True)
-
 		elif gle.posting_date <= to_date or (cstr(gle.is_opening) == "Yes" and show_opening_entries):
 			if not group_by_voucher_consolidated:
 				update_value_in_dict(gle_map[group_by_value].totals, "total", gle)
 				update_value_in_dict(gle_map[group_by_value].totals, "closing", gle)
 				update_value_in_dict(totals, "total", gle)
 				update_value_in_dict(totals, "closing", gle)
-
 				gle_map[group_by_value].entries.append(gle)
-
 			elif group_by_voucher_consolidated:
-				keylist = [
-					gle.get("posting_date"),
-					gle.get("voucher_type"),
-					gle.get("voucher_no"),
-					gle.get("account"),
-					gle.get("party_type"),
-					gle.get("party"),
-				]
-
-				if immutable_ledger:
-					keylist.append(gle.get("creation"))
-
+				keylist = [gle.get("posting_date"), gle.get("voucher_type"), gle.get("voucher_no"), gle.get("account"), gle.get("party_type"), gle.get("party")]
+				if immutable_ledger: keylist.append(gle.get("creation"))
 				if filters.get("include_dimensions"):
-					for dim in accounting_dimensions:
-						keylist.append(gle.get(dim))
+					for dim in accounting_dimensions: keylist.append(gle.get(dim))
 					keylist.append(gle.get("cost_center"))
 					keylist.append(gle.get("project"))
-
 				key = tuple(keylist)
 				if key not in consolidated_gle:
 					consolidated_gle.setdefault(key, gle)
 				else:
 					update_value_in_dict(consolidated_gle, key, gle)
-
-		if filters.get("include_dimensions"):
-			dimensions = [*accounting_dimensions, "cost_center", "project"]
-
-			for dimension in dimensions:
-				if val := gle.get(dimension):
-					gle[dimension] = _(val)
 
 	for value in consolidated_gle.values():
 		update_value_in_dict(totals, "total", value)
@@ -646,56 +596,43 @@ def get_accountwise_gle(filters, accounting_dimensions, gl_entries, gle_map, tot
 
 
 def get_account_type_map(company):
-	account_type_map = frappe._dict(
-		frappe.get_all("Account", fields=["name", "account_type"], filters={"company": company}, as_list=1)
-	)
-
-	return account_type_map
+	"""Return a map of account name to account type"""
+	return frappe._dict(frappe.get_all("Account", fields=["name", "account_type"], filters={"company": company}, as_list=1))
 
 
 def get_result_as_list(data, filters):
+	"""Format the final data list and calculate running balance"""
 	balance = 0
-
 	for d in data:
-		# CUSTOM CHANGE: Ensure every row has the custom keys to prevent export format errors
+		# Ensure every row has custom keys for consistent export formatting
 		d.setdefault("supplier_pan", "")
 		d.setdefault("tax_rate", "")
 		d.setdefault("taxable_value", 0.0)
 		d.setdefault("voucher_type", "")
-
-		if not d.get("posting_date"):
-			balance = 0
-
+		if not d.get("posting_date"): balance = 0
 		balance = get_balance(d, balance, "debit", "credit")
-
 		d["balance"] = balance
-
 		d["account_currency"] = filters.account_currency
-
 		d["presentation_currency"] = filters.presentation_currency
-
 	return data
 
 
 def get_supplier_invoice_details():
+	"""Fetch Bill Number from Purchase Invoices"""
 	inv_details = {}
-	for d in frappe.db.sql(
-		""" select name, bill_no from `tabPurchase Invoice`
-		where docstatus = 1 and bill_no is not null and bill_no != '' """,
-		as_dict=1,
-	):
+	for d in frappe.db.sql(""" select name, bill_no from `tabPurchase Invoice` where docstatus = 1 and bill_no is not null and bill_no != '' """, as_dict=1):
 		inv_details[d.name] = d.bill_no
-
 	return inv_details
 
 
 def get_balance(row, balance, debit_field, credit_field):
+	"""Update running balance"""
 	balance += row.get(debit_field, 0) - row.get(credit_field, 0)
-
 	return balance
 
 
 def get_columns(filters):
+	"""Define report column structure"""
 	if filters.get("presentation_currency"):
 		currency = filters["presentation_currency"]
 	else:
@@ -703,100 +640,33 @@ def get_columns(filters):
 		filters["presentation_currency"] = currency = get_company_currency(company)
 
 	company_currency = get_company_currency(filters.get("company") or get_default_company())
-
-	if (
-		filters.get("show_amount_in_company_currency")
-		and filters["presentation_currency"] != company_currency
-	):
-		frappe.throw(
-			_(
-				f'Presentation Currency cannot be {frappe.bold(filters["presentation_currency"])} , When {frappe.bold("Show Credit / Debit in Company Currency")} is enabled.'
-			)
-		)
+	if filters.get("show_amount_in_company_currency") and filters["presentation_currency"] != company_currency:
+		frappe.throw(_(f'Presentation Currency cannot be {frappe.bold(filters["presentation_currency"])} , When {frappe.bold("Show Credit / Debit in Company Currency")} is enabled.'))
 
 	columns = [
-		{
-			"label": _("GL Entry"),
-			"fieldname": "gl_entry",
-			"fieldtype": "Link",
-			"options": "GL Entry",
-			"hidden": 1,
-		},
+		{"label": _("GL Entry"), "fieldname": "gl_entry", "fieldtype": "Link", "options": "GL Entry", "hidden": 1},
 		{"label": _("Posting Date"), "fieldname": "posting_date", "fieldtype": "Date", "width": 120},
-		{
-			"label": _("Account"),
-			"fieldname": "account",
-			"fieldtype": "Link",
-			"options": "Account",
-			"width": 180,
-		},
-		# CUSTOM CHANGE: Columns setup
+		{"label": _("Account"), "fieldname": "account", "fieldtype": "Link", "options": "Account", "width": 180},
+		# CUSTOM COLUMNS
 		{"label": _("Supplier PAN"), "fieldname": "supplier_pan", "fieldtype": "Data", "width": 130},
 		{"label": _("Tax Rate"), "fieldname": "tax_rate", "fieldtype": "Data", "width": 100},
 		{"label": _("Taxable Value"), "fieldname": "taxable_value", "fieldtype": "Currency", "options": "presentation_currency", "width": 120},
-		{
-			"label": _("Debit ({0})").format(currency),
-			"fieldname": "debit",
-			"fieldtype": "Currency",
-			"options": "presentation_currency",
-			"width": 130,
-		},
-		{
-			"label": _("Credit ({0})").format(currency),
-			"fieldname": "credit",
-			"fieldtype": "Currency",
-			"options": "presentation_currency",
-			"width": 130,
-		},
-		{
-			"label": _("Balance ({0})").format(currency),
-			"fieldname": "balance",
-			"fieldtype": "Currency",
-			"options": "presentation_currency",
-			"width": 130,
-		},
+		{"label": _("Debit ({0})").format(currency), "fieldname": "debit", "fieldtype": "Currency", "options": "presentation_currency", "width": 130},
+		{"label": _("Credit ({0})").format(currency), "fieldname": "credit", "fieldtype": "Currency", "options": "presentation_currency", "width": 130},
+		{"label": _("Balance ({0})").format(currency), "fieldname": "balance", "fieldtype": "Currency", "options": "presentation_currency", "width": 130},
 	]
 
 	if filters.get("add_values_in_transaction_currency"):
 		columns += [
-			{
-				"label": _("Debit (Transaction)"),
-				"fieldname": "debit_in_transaction_currency",
-				"fieldtype": "Currency",
-				"width": 130,
-				"options": "transaction_currency",
-			},
-			{
-				"label": _("Credit (Transaction)"),
-				"fieldname": "credit_in_transaction_currency",
-				"fieldtype": "Currency",
-				"width": 130,
-				"options": "transaction_currency",
-			},
-			{
-				"label": "Transaction Currency",
-				"fieldname": "transaction_currency",
-				"fieldtype": "Link",
-				"options": "Currency",
-				"width": 70,
-			},
+			{"label": _("Debit (Transaction)"), "fieldname": "debit_in_transaction_currency", "fieldtype": "Currency", "width": 130, "options": "transaction_currency"},
+			{"label": _("Credit (Transaction)"), "fieldname": "credit_in_transaction_currency", "fieldtype": "Currency", "width": 130, "options": "transaction_currency"},
+			{"label": "Transaction Currency", "fieldname": "transaction_currency", "fieldtype": "Link", "options": "Currency", "width": 70},
 		]
 
 	columns += [
 		{"label": _("Voucher Type"), "fieldname": "voucher_type", "width": 120},
-		{
-			"label": _("Voucher Subtype"),
-			"fieldname": "voucher_subtype",
-			"fieldtype": "Data",
-			"width": 180,
-		},
-		{
-			"label": _("Voucher No"),
-			"fieldname": "voucher_no",
-			"fieldtype": "Dynamic Link",
-			"options": "voucher_type",
-			"width": 180,
-		},
+		{"label": _("Voucher Subtype"), "fieldname": "voucher_subtype", "fieldtype": "Data", "width": 180},
+		{"label": _("Voucher No"), "fieldname": "voucher_no", "fieldtype": "Dynamic Link", "options": "voucher_type", "width": 180},
 		{"label": _("Against Account"), "fieldname": "against", "width": 120},
 		{"label": _("Party Type"), "fieldname": "party_type", "width": 100},
 		{"label": _("Party"), "fieldname": "party", "width": 100},
@@ -804,41 +674,20 @@ def get_columns(filters):
 
 	supplier_master_name = frappe.db.get_single_value("Buying Settings", "supp_master_name")
 	customer_master_name = frappe.db.get_single_value("Selling Settings", "cust_master_name")
-
 	if supplier_master_name != "Supplier Name" or customer_master_name != "Customer Name":
-		columns.append(
-			{
-				"label": _("Party Name"),
-				"fieldname": "party_name",
-				"fieldtype": "Data",
-				"width": 150,
-			}
-		)
+		columns.append({"label": _("Party Name"), "fieldname": "party_name", "fieldtype": "Data", "width": 150})
 
 	if filters.get("include_dimensions"):
 		columns.append({"label": _("Project"), "options": "Project", "fieldname": "project", "width": 100})
-
 		for dim in get_accounting_dimensions(as_list=False):
-			columns.append(
-				{"label": _(dim.label), "options": dim.label, "fieldname": dim.fieldname, "width": 100}
-			)
-		columns.append(
-			{"label": _("Cost Center"), "options": "Cost Center", "fieldname": "cost_center", "width": 100}
-		)
+			columns.append({"label": _(dim.label), "options": dim.label, "fieldname": dim.fieldname, "width": 100})
+		columns.append({"label": _("Cost Center"), "options": "Cost Center", "fieldname": "cost_center", "width": 100})
 
-	columns.extend(
-		[
-			{"label": _("Against Voucher Type"), "fieldname": "against_voucher_type", "width": 100},
-			{
-				"label": _("Against Voucher"),
-				"fieldname": "against_voucher",
-				"fieldtype": "Dynamic Link",
-				"options": "against_voucher_type",
-				"width": 100,
-			},
-			{"label": _("Supplier Invoice No"), "fieldname": "bill_no", "fieldtype": "Data", "width": 100},
-		]
-	)
+	columns.extend([
+		{"label": _("Against Voucher Type"), "fieldname": "against_voucher_type", "width": 100},
+		{"label": _("Against Voucher"), "fieldname": "against_voucher", "fieldtype": "Dynamic Link", "options": "against_voucher_type", "width": 100},
+		{"label": _("Supplier Invoice No"), "fieldname": "bill_no", "fieldtype": "Data", "width": 100},
+	])
 
 	if filters.get("show_remarks"):
 		columns.extend([{"label": _("Remarks"), "fieldname": "remarks", "width": 400}])
